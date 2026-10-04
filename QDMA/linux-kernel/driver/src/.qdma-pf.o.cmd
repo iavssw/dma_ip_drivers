@@ -1,0 +1,1 @@
+savedcmd_/home/greg/v80_nfs/dma_ip_drivers_fork/QDMA/linux-kernel/driver/src/qdma-pf.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o /home/greg/v80_nfs/dma_ip_drivers_fork/QDMA/linux-kernel/driver/src/qdma-pf.o @/home/greg/v80_nfs/dma_ip_drivers_fork/QDMA/linux-kernel/driver/src/qdma-pf.mod 

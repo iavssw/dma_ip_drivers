@@ -29,12 +29,15 @@
 #include <linux/spinlock_types.h>
 
 #include "libqdma/libqdma_export.h"
+#include "qdma_ioctl.h"
 #include <linux/workqueue.h>
+#include "qdma_persistent.h"
 
 /** QDMA character device class name */
 #define QDMA_CDEV_CLASS_NAME  DRV_MODULE_NAME
 /** QDMA character device max minor number to support 4k queues */
 #define QDMA_MINOR_MAX (4096)
+
 
 /* per pci device control */
 /**
@@ -57,6 +60,9 @@ struct qdma_cdev_cb {
  * @brief	QDMA character device book keeping parameters
  */
 struct qdma_cdev {
+	atomic_t persistent_users; /* open file contexts, including retained DMA */
+	bool deleting;
+	struct device lifetime_device; /* parent keeps embedded cdev alive through open races */
 	/** lsit of qdma character devices */
 	struct list_head list_head;
 	/** minor number */

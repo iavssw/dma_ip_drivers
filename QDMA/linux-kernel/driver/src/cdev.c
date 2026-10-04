@@ -17,6 +17,7 @@
  * the file called "COPYING".
  */
 
+#include <asm-generic/errno-base.h>
 #define pr_fmt(fmt)	KBUILD_MODNAME ":%s: " fmt, __func__
 
 #include "cdev.h"
@@ -40,12 +41,16 @@
 #include <linux/uio.h>
 #endif
 
+#include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
 #include "qdma_mod.h"
 #include "libqdma/xdev.h"
 
 #ifdef USER_EXTRA_SUPPORTED
 #include "../user_extra/user_extra.h"
 #endif
+#include <linux/ktime.h>
+#include <linux/printk.h>
 
 /*
  * @struct - xlnx_phy_dev
@@ -75,16 +80,14 @@ struct cdev_async_io {
 	struct work_struct wrk_itm;
 };
 
-enum qdma_cdev_ioctl_cmd {
-	QDMA_CDEV_IOCTL_NO_MEMCPY,
-	QDMA_CDEV_IOCTL_CMDS
-};
-
 static struct class *qdma_class;
 static struct kmem_cache *cdev_cache;
 
 static ssize_t cdev_gen_read_write(struct file *file, char __user *buf,
 		size_t count, loff_t *pos, bool write);
+static long handle_p2p_dma(struct qdma_cdev *xcdev, unsigned long arg);
+static ssize_t convert_sgl(struct sg_table *sgt, struct qdma_io_cb *iocb, unsigned int requested_bytes);
+static ssize_t submit_p2p_dma_request(struct qdma_cdev *xcdev, struct qdma_p2p_req* p2p_req, struct qdma_io_cb *iocb, u64* duration_ns);
 static void unmap_user_buf(struct qdma_io_cb *iocb, bool write);
 static inline void iocb_release(struct qdma_io_cb *iocb);
 
@@ -171,39 +174,53 @@ static int qdma_req_completed(struct qdma_request *req,
  */
 static int cdev_gen_open(struct inode *inode, struct file *file)
 {
-	struct qdma_cdev *xcdev = container_of(inode->i_cdev, struct qdma_cdev,
-						cdev);
-	int rv = 0;
-
-	file->private_data = xcdev;
-	if (xcdev->fp_open_extra) {
-		rv = xcdev->fp_open_extra(xcdev);
-		if (rv < 0) {
-			pr_err("Extra open callback failed: %d\n", rv);
-			return rv;
-		}
-	}
-	return 0;
+    struct qdma_cdev *xcdev = container_of(inode->i_cdev, struct qdma_cdev, cdev);
+    struct qdma_file_ctx *ctx;
+    int rv = 0;
+    mutex_lock(&qdma_cdev_lifecycle_mutex);
+    if (xcdev->deleting) {
+        rv = -ENODEV;
+        goto out;
+    }
+    ctx = qdma_persistent_open(xcdev);
+    if (IS_ERR(ctx)) {
+        rv = PTR_ERR(ctx);
+        goto out;
+    }
+    file->private_data = ctx;
+    if (xcdev->fp_open_extra)
+        rv = xcdev->fp_open_extra(xcdev);
+    if (rv < 0) {
+        pr_err("Extra open callback failed: %d\n", rv);
+        file->private_data = NULL;
+        qdma_persistent_close(ctx);
+    } else {
+        rv = 0;
+    }
+out:
+    mutex_unlock(&qdma_cdev_lifecycle_mutex);
+    return rv;
 }
 
 static int cdev_gen_close(struct inode *inode, struct file *file)
 {
-	struct qdma_cdev *xcdev = (struct qdma_cdev *)file->private_data;
-	int rv = 0;
-
-	if (xcdev && xcdev->fp_close_extra) {
-		rv = xcdev->fp_close_extra(xcdev);
-		if (rv < 0) {
-			pr_warn("Extra close callback failed: %d\n", rv);
-			return rv;
-		}
-	}
-	return 0;
+    struct qdma_file_ctx *ctx = file->private_data;
+    struct qdma_cdev *xcdev = ctx->xcdev;
+    int rv = 0;
+    if (xcdev->fp_close_extra)
+        rv = xcdev->fp_close_extra(xcdev);
+    if (rv < 0)
+        pr_warn("Extra close callback failed: %d\n", rv);
+    else
+        rv = 0;
+    file->private_data = NULL;
+    qdma_persistent_close(ctx);
+    return rv;
 }
 
 static loff_t cdev_gen_llseek(struct file *file, loff_t off, int whence)
 {
-	struct qdma_cdev *xcdev = (struct qdma_cdev *)file->private_data;
+	struct qdma_cdev *xcdev = ((struct qdma_file_ctx *)file->private_data)->xcdev;
 
 	loff_t newpos = 0;
 
@@ -232,13 +249,21 @@ static loff_t cdev_gen_llseek(struct file *file, loff_t off, int whence)
 static long cdev_gen_ioctl(struct file *file, unsigned int cmd,
 			unsigned long arg)
 {
-	struct qdma_cdev *xcdev = (struct qdma_cdev *)file->private_data;
+	struct qdma_cdev *xcdev = ((struct qdma_file_ctx *)file->private_data)->xcdev;
 	int rv = 0;
 
 	switch (cmd) {
 	case QDMA_CDEV_IOCTL_NO_MEMCPY:
 		get_user(xcdev->no_memcpy, (unsigned char *)arg);
 		return 0;
+	case QDMA_CDEV_IOCTL_P2P_DMA:
+	    return handle_p2p_dma(xcdev, arg);
+    case QDMA_CDEV_IOCTL_CAPS:
+    case QDMA_CDEV_IOCTL_REGISTER:
+    case QDMA_CDEV_IOCTL_TRANSFER_REGISTERED:
+    case QDMA_CDEV_IOCTL_UNREGISTER:
+    case QDMA_CDEV_IOCTL_STATS:
+        return qdma_persistent_ioctl(file->private_data, cmd, arg);
 	default:
 		break;
 	}
@@ -263,6 +288,123 @@ static inline void iocb_release(struct qdma_io_cb *iocb)
 	iocb->sgl = NULL;
 	iocb->buf = NULL;
 }
+
+static long handle_p2p_dma(struct qdma_cdev *xcdev, unsigned long arg)
+{
+    struct qdma_p2p_req p2p_req;
+    struct qdma_io_cb iocb = {0};
+    struct dma_buf *dmabuf;
+    struct dma_buf_attachment *attachment;
+    struct sg_table *sgt;
+    u64 duration = 0;
+    ssize_t bytes;
+    long rv;
+    if (copy_from_user(&p2p_req, (void __user *)arg, sizeof(p2p_req)))
+        return -EFAULT;
+    if ((p2p_req.direction != QDMA_P2P_READ &&
+         p2p_req.direction != QDMA_P2P_WRITE) || !p2p_req.num_bytes ||
+        p2p_req.dev_addr > U64_MAX - p2p_req.num_bytes)
+        return -EINVAL;
+    if (!(xcdev->dir_init & (1 << (p2p_req.direction == QDMA_P2P_WRITE ?
+                                  Q_H2C : Q_C2H))))
+        return -EINVAL;
+    dmabuf = dma_buf_get(p2p_req.dmabuf_fd);
+    if (IS_ERR(dmabuf))
+        return PTR_ERR(dmabuf);
+    if (p2p_req.num_bytes > dmabuf->size) {
+        rv = -EINVAL;
+        goto put;
+    }
+    attachment = dma_buf_attach(dmabuf, &xcdev->xcb->xpdev->pdev->dev);
+    if (IS_ERR(attachment)) {
+        rv = PTR_ERR(attachment);
+        goto put;
+    }
+    sgt = dma_buf_map_attachment(attachment, DMA_BIDIRECTIONAL);
+    if (IS_ERR(sgt)) {
+        rv = PTR_ERR(sgt);
+        goto detach;
+    }
+    rv = convert_sgl(sgt, &iocb, p2p_req.num_bytes);
+    if (rv)
+        goto unmap;
+    bytes = submit_p2p_dma_request(xcdev, &p2p_req, &iocb, &duration);
+    if (bytes < 0) {
+        rv = bytes;
+        goto release_iocb;
+    }
+    p2p_req.response.bytes_transferred = bytes;
+    p2p_req.response.transfer_duration_ns = duration;
+    rv = copy_to_user((void __user *)arg, &p2p_req, sizeof(p2p_req)) ? -EFAULT : 0;
+release_iocb:
+    iocb_release(&iocb);
+unmap:
+    dma_buf_unmap_attachment(attachment, sgt, DMA_BIDIRECTIONAL);
+detach:
+    dma_buf_detach(dmabuf, attachment);
+put:
+    dma_buf_put(dmabuf);
+    return rv;
+}
+
+static ssize_t convert_sgl(struct sg_table *sgt, struct qdma_io_cb *iocb,
+                            unsigned int requested_bytes)
+{
+    struct qdma_sw_sg *out;
+    struct scatterlist *sg;
+    unsigned int i, used = 0, remaining = requested_bytes;
+    out = kcalloc(sgt->nents, sizeof(*out), GFP_KERNEL);
+    if (!out)
+        return -ENOMEM;
+    for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+        unsigned int bytes;
+        if (!remaining)
+            break;
+        bytes = min(sg_dma_len(sg), remaining);
+        if (!bytes)
+            continue;
+        out[used].dma_addr = sg_dma_address(sg);
+        out[used].len = bytes;
+        if (used)
+            out[used - 1].next = &out[used];
+        used++;
+        remaining -= bytes;
+    }
+    if (remaining || !used) {
+        kfree(out);
+        return -EINVAL;
+    }
+    iocb->sgl = out;
+    iocb->pages_nr = used;
+    return 0;
+}
+
+static ssize_t submit_p2p_dma_request(struct qdma_cdev *xcdev, struct qdma_p2p_req* p2p_req, struct qdma_io_cb *iocb, u64* duration_ns) {
+    struct qdma_request *dma_req = &(iocb->req);
+    dma_req->sgcnt = iocb->pages_nr;
+    dma_req->sgl = iocb->sgl;
+    dma_req->write = (p2p_req->direction == QDMA_P2P_WRITE) ? 1 : 0;
+    dma_req->dma_mapped = 1;
+    dma_req->udd_len = 0;
+    dma_req->ep_addr = (u64)(p2p_req->dev_addr);
+    dma_req->count = p2p_req->num_bytes;
+    dma_req->timeout_ms = 10 * 1000;	/* 10 seconds */
+    dma_req->fp_done = NULL;		/* blocking */
+    dma_req->h2c_eot = 1;		/* set to 1 for STM tests */
+
+    unsigned long qhndl = (p2p_req->direction == QDMA_P2P_WRITE) ? xcdev->h2c_qhndl : xcdev->c2h_qhndl;
+
+    u64 start = ktime_get_ns();
+    ssize_t rv = xcdev->fp_rw(xcdev->xcb->xpdev->dev_hndl, qhndl, dma_req);
+    u64 end = ktime_get_ns();
+
+    *duration_ns = end - start;
+    // printk(KERN_INFO "submit_p2p_dma_request: request execution time: %llu ns. Length %lu bytes\n", end - start, rv);
+
+    return rv;
+}
+
+
 
 static void unmap_user_buf(struct qdma_io_cb *iocb, bool write)
 {
@@ -373,7 +515,7 @@ err_out:
 static ssize_t cdev_gen_read_write(struct file *file, char __user *buf,
 		size_t count, loff_t *pos, bool write)
 {
-	struct qdma_cdev *xcdev = (struct qdma_cdev *)file->private_data;
+	struct qdma_cdev *xcdev = ((struct qdma_file_ctx *)file->private_data)->xcdev;
 	struct qdma_io_cb iocb;
 	struct qdma_request *req = &iocb.req;
 	ssize_t res = 0;
@@ -440,7 +582,7 @@ static ssize_t cdev_aio_write(struct kiocb *iocb, const struct iovec *io,
 				unsigned long count, loff_t pos)
 {
 	struct qdma_cdev *xcdev =
-		(struct qdma_cdev *)iocb->ki_filp->private_data;
+		((struct qdma_file_ctx *)iocb->ki_filp->private_data)->xcdev;
 	struct cdev_async_io *caio;
 	int rv = 0;
 	unsigned long i;
@@ -515,7 +657,7 @@ static ssize_t cdev_aio_read(struct kiocb *iocb, const struct iovec *io,
 						unsigned long count, loff_t pos)
 {
 	struct qdma_cdev *xcdev =
-		(struct qdma_cdev *)iocb->ki_filp->private_data;
+		((struct qdma_file_ctx *)iocb->ki_filp->private_data)->xcdev;
 	struct cdev_async_io *caio;
 	int rv = 0;
 	unsigned long i;
@@ -625,6 +767,23 @@ static ssize_t cdev_read_iter(struct kiocb *iocb, struct iov_iter *io)
 }
 #endif
 
+#ifdef CONFIG_COMPAT
+static long cdev_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    /* The historical native-layout ioctl has no 32-bit compatibility ABI. */
+    switch (cmd) {
+    case QDMA_CDEV_IOCTL_CAPS:
+    case QDMA_CDEV_IOCTL_REGISTER:
+    case QDMA_CDEV_IOCTL_TRANSFER_REGISTERED:
+    case QDMA_CDEV_IOCTL_UNREGISTER:
+    case QDMA_CDEV_IOCTL_STATS:
+        return qdma_persistent_ioctl(file->private_data, cmd, arg);
+    default:
+        return -ENOIOCTLCMD;
+    }
+}
+#endif
+
 static const struct file_operations cdev_gen_fops = {
 	.owner = THIS_MODULE,
 	.open = cdev_gen_open,
@@ -642,6 +801,9 @@ static const struct file_operations cdev_gen_fops = {
 	.aio_read = cdev_aio_read,
 #endif
 	.unlocked_ioctl = cdev_gen_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = cdev_compat_ioctl,
+#endif
 	.llseek = cdev_gen_llseek,
 };
 
@@ -649,6 +811,12 @@ static const struct file_operations cdev_gen_fops = {
  * xcb: per pci device character device control info.
  * xcdev: per queue character device
  */
+static void qdma_cdev_release_device(struct device *device)
+{
+    struct qdma_cdev *xcdev = container_of(device, struct qdma_cdev, lifetime_device);
+    kfree(xcdev);
+}
+
 void qdma_cdev_destroy(struct qdma_cdev *xcdev)
 {
 
@@ -656,6 +824,11 @@ void qdma_cdev_destroy(struct qdma_cdev *xcdev)
 		pr_err("xcdev is NULL.\n");
 		return;
 	}
+    /* Ordinary delete holds the lifecycle mutex. Retained contexts prevent
+     * teardown even after the last userspace fd closes. */
+    if (WARN_ON(atomic_read(&xcdev->persistent_users)))
+        return;
+    xcdev->deleting = true;
 	pr_debug("destroying cdev %p", xcdev);
 
 	if (xcdev->sys_device)
@@ -663,7 +836,10 @@ void qdma_cdev_destroy(struct qdma_cdev *xcdev)
 
 	cdev_del(&xcdev->cdev);
 
-	kfree(xcdev);
+    /* cdev_add holds a parent-device reference. An open callback that was
+     * already entered before deletion retains the cdev kobject and therefore
+     * this allocation until it observes deleting and returns. */
+    put_device(&xcdev->lifetime_device);
 }
 
 int qdma_cdev_create(struct qdma_cdev_cb *xcb, struct pci_dev *pdev,
@@ -690,7 +866,9 @@ int qdma_cdev_create(struct qdma_cdev_cb *xcb, struct pci_dev *pdev,
 		return -ENOMEM;
 	}
 
-	xcdev->cdev.owner = THIS_MODULE;
+    device_initialize(&xcdev->lifetime_device);
+    xcdev->lifetime_device.release = qdma_cdev_release_device;
+    xcdev->deleting = true; /* do not allow open until initialization completes */
 	xcdev->xcb = xcb;
 	priv_data = (qconf->q_type == Q_C2H) ?
 			&xcdev->c2h_qhndl : &xcdev->h2c_qhndl;
@@ -712,6 +890,8 @@ int qdma_cdev_create(struct qdma_cdev_cb *xcb, struct pci_dev *pdev,
 	xcdev->cdevno = MKDEV(xcb->cdev_major, xcdev->minor);
 
 	cdev_init(&xcdev->cdev, &cdev_gen_fops);
+    xcdev->cdev.owner = THIS_MODULE;
+    cdev_set_parent(&xcdev->cdev, &xcdev->lifetime_device.kobj);
 
 	/* bring character device live */
 	rv = cdev_add(&xcdev->cdev, xcdev->cdevno, 1);
@@ -749,6 +929,10 @@ int qdma_cdev_create(struct qdma_cdev_cb *xcb, struct pci_dev *pdev,
 #ifdef USER_EXTRA_SUPPORTED
 	user_extra_cdev_register_cb(xcdev);
 #endif
+
+    mutex_lock(&qdma_cdev_lifecycle_mutex);
+    xcdev->deleting = false;
+    mutex_unlock(&qdma_cdev_lifecycle_mutex);
 	*xcdev_pp = xcdev;
 	return 0;
 
@@ -756,7 +940,7 @@ del_cdev:
 	cdev_del(&xcdev->cdev);
 
 err_out:
-	kfree(xcdev);
+    put_device(&xcdev->lifetime_device);
 	return rv;
 }
 
@@ -865,6 +1049,8 @@ int qdma_cdev_init(void)
 					NULL);
 	if (!cdev_cache) {
 		pr_err("failed to allocate cdev_cache\n");
+        class_destroy(qdma_class);
+        qdma_class = NULL;
 		return -ENOMEM;
 	}
 

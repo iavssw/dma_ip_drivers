@@ -36,6 +36,8 @@
 /* include early, to verify it depends only on the headers above */
 #include "version.h"
 
+#include "qdma_p2pdma.h"
+
 #define QDMA_DEFAULT_TOTAL_Q 2048
 
 static char version[] =
@@ -45,6 +47,17 @@ MODULE_AUTHOR("Xilinx, Inc.");
 MODULE_DESCRIPTION(DRV_MODULE_DESC);
 MODULE_VERSION(DRV_MODULE_VERSION);
 MODULE_LICENSE("Dual BSD/GPL");
+
+#define __NS_STR(x) #x
+#define _NS_STR(x)  __NS_STR(x)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
+  /* 6.13+ expects a string literal */
+  #define MODULE_IMPORT_NS_COMPAT(ns) MODULE_IMPORT_NS(_NS_STR(ns))
+#else
+  /* ≤6.12 expects a bare identifier */
+  #define MODULE_IMPORT_NS_COMPAT(ns) MODULE_IMPORT_NS(ns)
+#endif
+MODULE_IMPORT_NS_COMPAT(DMA_BUF);
 
 static char mode[500] = {0};
 module_param_string(mode, mode, sizeof(mode), 0);
@@ -1088,7 +1101,7 @@ struct xlnx_qdata *xpdev_queue_get(struct xlnx_pci_dev *xpdev,
 	return qdata;
 }
 
-int xpdev_queue_delete(struct xlnx_pci_dev *xpdev, unsigned int qidx, u8 q_type,
+static int xpdev_queue_delete_locked(struct xlnx_pci_dev *xpdev, unsigned int qidx, u8 q_type,
 			char *ebuf, int ebuflen)
 {
 	struct xlnx_qdata *qdata = xpdev_queue_get(xpdev, qidx, q_type, 1, ebuf,
@@ -1101,6 +1114,11 @@ int xpdev_queue_delete(struct xlnx_pci_dev *xpdev, unsigned int qidx, u8 q_type,
 	if (q_type != Q_CMPT) {
 		if (!qdata->xcdev)
 			return -EINVAL;
+        if (atomic_read(&qdata->xcdev->persistent_users)) {
+            if (ebuf && ebuflen)
+                snprintf(ebuf, ebuflen, "queue is in use by open files or retained DMA; close/drain clients first\n");
+            return -EBUSY;
+        }
 	}
 
 	if (qdata->qhndl != QDMA_QUEUE_IDX_INVALID)
@@ -1124,6 +1142,16 @@ int xpdev_queue_delete(struct xlnx_pci_dev *xpdev, unsigned int qidx, u8 q_type,
 	memset(qdata, 0, sizeof(*qdata));
 exit:
 	return rv;
+}
+
+int xpdev_queue_delete(struct xlnx_pci_dev *xpdev, unsigned int qidx, u8 q_type,
+                       char *ebuf, int ebuflen)
+{
+    int rv;
+    mutex_lock(&qdma_cdev_lifecycle_mutex);
+    rv = xpdev_queue_delete_locked(xpdev, qidx, q_type, ebuf, ebuflen);
+    mutex_unlock(&qdma_cdev_lifecycle_mutex);
+    return rv;
 }
 
 #if KERNEL_VERSION(3, 16, 0) <= LINUX_VERSION_CODE
@@ -1602,6 +1630,12 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rv < 0)
 		return rv;
 
+	pr_info("Device BARs: %d (config), %d (user), %d (bypass).\n", conf.bar_num_config, conf.bar_num_user, conf.bar_num_bypass);
+	rv = qdma_p2pdma_probe(pdev, conf.bar_num_user);
+	if (rv != 0) {
+		goto close_device;
+	}
+
 	xpdev = xpdev_alloc(pdev, conf.qsets_max);
 	if (!xpdev) {
 		rv = -EINVAL;
@@ -1677,6 +1711,8 @@ static void remove_one(struct pci_dev *pdev)
 
 	pr_info("%s pdev 0x%p, xdev 0x%p, hndl 0x%lx, qdma%05x.\n",
 		dev_name(&pdev->dev), pdev, xpdev, xpdev->dev_hndl, xpdev->idx);
+
+	qdma_p2pdma_remove(pdev);
 
 	if (xdev->conf.master_pf)
 		sysfs_remove_group(&pdev->dev.kobj,
@@ -1895,29 +1931,45 @@ static struct pci_driver pci_driver = {
 
 static int __init qdma_mod_init(void)
 {
-	int rv;
-
-	pr_info("%s", version);
-
-	rv = libqdma_init(num_threads, NULL);
-	if (rv < 0)
-		return rv;
-
-	rv = xlnx_nl_init();
-	if (rv < 0)
-		return rv;
-
-	rv = qdma_cdev_init();
-	if (rv < 0)
-		return rv;
-
-	return pci_register_driver(&pci_driver);
+    int rv;
+    pr_info("%s", version);
+    rv = qdma_persistent_init();
+    if (rv)
+        return rv;
+    rv = libqdma_init(num_threads, NULL);
+    if (rv < 0)
+        goto persistent_fail;
+    rv = xlnx_nl_init();
+    if (rv < 0)
+        goto library_fail;
+    rv = qdma_cdev_init();
+    if (rv < 0)
+        goto netlink_fail;
+    rv = qdma_p2pdma_init();
+    if (rv)
+        goto cdev_fail;
+    rv = pci_register_driver(&pci_driver);
+    if (!rv)
+        return 0;
+    qdma_p2pdma_exit();
+cdev_fail:
+    qdma_cdev_cleanup();
+netlink_fail:
+    xlnx_nl_exit();
+library_fail:
+    libqdma_exit();
+persistent_fail:
+    qdma_persistent_shutdown();
+    return rv;
 }
 
 static void __exit qdma_mod_exit(void)
 {
+    qdma_persistent_shutdown();
 	/* unregister this driver from the PCI bus driver */
 	pci_unregister_driver(&pci_driver);
+
+	qdma_p2pdma_exit();
 
 	xlnx_nl_exit();
 

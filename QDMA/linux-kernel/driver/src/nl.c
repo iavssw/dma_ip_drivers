@@ -1902,12 +1902,22 @@ static int xnl_q_stop(struct sk_buff *skb2, struct genl_info *info)
 			qconf.q_type = dir;
 stop_q:
 		qconf.qidx = i;
+        mutex_lock(&qdma_cdev_lifecycle_mutex);
 		qdata = xnl_rcv_check_qidx(info, xpdev, &qconf, buf,
 					XNL_RESP_BUFLEN_MIN);
-		if (!qdata)
-			goto send_resp;
+        if (!qdata) {
+            mutex_unlock(&qdma_cdev_lifecycle_mutex);
+            goto send_resp;
+        }
+        if (qdata->xcdev && atomic_read(&qdata->xcdev->persistent_users)) {
+            snprintf(buf, sizeof(buf), "queue is in use by open files or retained DMA; close/drain clients first\n");
+            rv = -EBUSY;
+            mutex_unlock(&qdma_cdev_lifecycle_mutex);
+            goto send_resp;
+        }
 		rv = qdma_queue_stop(xpdev->dev_hndl, qdata->qhndl,
 				     buf, XNL_RESP_BUFLEN_MIN);
+        mutex_unlock(&qdma_cdev_lifecycle_mutex);
 		if (rv < 0) {
 			pr_err("qdma_queue_stop() failed: %d", rv);
 			goto send_resp;

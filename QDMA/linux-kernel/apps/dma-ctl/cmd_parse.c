@@ -218,12 +218,12 @@ static void __attribute__((noreturn)) usage(FILE *fp)
 			"\t\tq add list <start_idx> <num_Qs> [mode <mm|st>] [dir <h2c|c2h|bi|cmpt>] - add multiple queues at once\n"
 	        "\t\tq start idx <N> [dir <h2c|c2h|bi|cmpt>] [idx_ringsz <0:15>] [idx_bufsz <0:15>] [idx_tmr <0:15>]\n"
 		   "                                    [idx_cntr <0:15>] [trigmode <every|usr_cnt|usr|usr_tmr|dis>] [cmptsz <0|1|2|3>] [sw_desc_sz <3>]\n"
-	        "                                    [mm_chn <0|1>] [desc_bypass_en] [pfetch_en] [pfetch_bypass_en] [dis_cmpl_status]\n"
+	        "                                    [mm_chn <0|1>] [mm_host_id <0..15>] [desc_bypass_en] [pfetch_en] [pfetch_bypass_en] [dis_cmpl_status]\n"
 	        "                                    [dis_cmpl_status_acc] [dis_cmpl_status_pend_chk] [c2h_udd_en]\n"
 			"                                    [cmpl_ovf_dis] [fetch_credit  <h2c|c2h|bi|none>] [dis_cmpl_status] [c2h_cmpl_intr_en] [aperture_sz <aperture size power of 2>]- start a single queue\n"
 	        "\t\tq start list <start_idx> <num_Qs> [dir <h2c|c2h|bi|cmpt>] [idx_bufsz <0:15>] [idx_tmr <0:15>]\n"
 			"                                    [idx_cntr <0:15>] [trigmode <every|usr_cnt|usr|usr_tmr|dis>] [cmptsz <0|1|2|3>] [sw_desc_sz <3>]\n"
-	        "                                    [mm_chn <0|1>] [desc_bypass_en] [pfetch_en] [pfetch_bypass_en] [dis_cmpl_status]\n"
+	        "                                    [mm_chn <0|1>] [mm_host_id <0..15>] [desc_bypass_en] [pfetch_en] [pfetch_bypass_en] [dis_cmpl_status]\n"
 	        "                                    [dis_cmpl_status_acc] [dis_cmpl_status_pend_chk] [cmpl_ovf_dis]\n"
 			"                                    [fetch_credit <h2c|c2h|bi|none>] [dis_cmpl_status] [c2h_cmpl_intr_en] [aperture_sz <aperture size power of 2>]- start multiple queues at once\n"
 	        "\t\tq stop idx <N> dir [<h2c|c2h|bi|cmpt>] - stop a single queue\n"
@@ -831,6 +831,17 @@ static int read_qparm(int argc, char *argv[], int i, struct xcmd_q_parm *qparm,
 
 			qparm->mm_channel = v1;
 			f_arg_set |= 1 << QPARM_MM_CHANNEL;
+			i++;
+		} else if (!strcmp(argv[i], "mm_host_id")) {
+			rv = next_arg_read_int(argc, argv, &i, &v1);
+			if (rv < 0)
+				return rv;
+			if (v1 > 15) {
+				warnx("mm_host_id must be in the range 0..15\n");
+				return -EINVAL;
+			}
+			qparm->mm_hostid = v1;
+			f_arg_set |= 1 << QPARM_MM_HOST_ID;
 			i++;
 		} else if (!strcmp(argv[i], "cmpl_ovf_dis")) {
 			qparm->flags |= XNL_F_CMPT_OVF_CHK_DIS;

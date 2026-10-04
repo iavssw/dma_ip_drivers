@@ -19,6 +19,7 @@ Contents
      3.2   Using dma-ctl for Queue control
 4.   QDMA test script
      Sample scripts to run simple MM and ST transfers 
+5.   V80 GPU DMA-BUF P2P support
 _____________________________________________________________________________
 
 1. Installation:
@@ -299,6 +300,62 @@ _____________________________________________________________________________
 
 
 
+5. V80 GPU DMA-BUF P2P support:
+--------------------------------
+
+  This fork includes the production P2P implementation from the paper's
+  TC_paper/5_p2p/qdma_driver/qdma_p2p_dmabuf.patch, adapted to the newer
+  driver callbacks. Existing V80 PCI IDs and Tandem support are preserved.
+  The unused multi-kernel-thread experiment is not included.
+
+  Build from QDMA/linux-kernel (Linux 6.8.0-142-generic validated):
+
+      make -j1 TANDEM_BOOT_SUPPORTED=1
+
+  Use a serial full build: PF/VF modules and applications share object files.
+  The outputs are bin/qdma-pf.ko and bin/qdma-vf.ko. Building does not install
+  or load them. For a PF-only build from the same directory:
+
+      make driver MODULE=mod_pf TANDEM_BOOT_SUPPORTED=1
+
+  NVIDIA A30 uses the per-transfer ioctl in driver/include/qdma_ioctl.h:
+    - QDMA_CDEV_IOCTL_P2P_DMA imports a CUDA-exported DMA-BUF fd.
+    - QDMA_P2P_READ transfers FPGA memory to GPU memory (C2H).
+    - QDMA_P2P_WRITE transfers GPU memory to FPGA memory (H2C).
+    - dev_addr is the FPGA AXI address; the DMA-BUF offset is zero.
+    - The response reports actual bytes transferred and driver duration in ns.
+
+  The ioctl is the existing 40-byte native x86-64 ABI used by both A30
+  benchmarks. It requires the selected queue direction to exist and returns
+  DMA submission/completion errors to userspace. The persistent registration
+  ioctls are included for the AMD GPU path; they do not support NVIDIA BAR1.
+
+  Use an NVIDIA driver supporting CUDA DMA-BUF export. Synchronize CUDA before
+  DMA and perform the required GPUDirect write-visibility flush before consuming
+  data written to the GPU. The paper's A30 benchmark implements this sequence.
+  The kernel needs CONFIG_DMA_SHARED_BUFFER and CONFIG_PCI_P2PDMA.
+
+  A user-memory BAR is published as a P2PDMA provider for NVMe-to-FPGA use.
+  Designs without a user-memory BAR skip publication; this does not prevent
+  Tandem programming, ordinary DMA, or GPU DMA-BUF import.
+
+  Queue stop/delete rejects queues held by open files or retained DMA. Close
+  and drain clients before reconfiguring queues or replacing the module.
+  This patch does not change IOMMU settings, PCIe links, the FPGA memory map,
+  or CPM host profiles. Two-channel throughput still depends on independent
+  FPGA memory paths and the PCIe route to the GPU.
+
+  Hardware-free checks, from QDMA/linux-kernel:
+
+      cc -std=c11 -Wall -Wextra -Werror -Idriver/include -Idriver/src \
+          driver/tests/persistent_logic_test.c -o /tmp/qdma-persistent-test
+      /tmp/qdma-persistent-test
+      python3 driver/tests/persistent_lifetime_model.py
+
+  These checks cover ABI, range/scatterlist accounting and lifetime contracts;
+  they do not replace a verified hardware P2P transfer.
+
+
   /*
   * This file is part of the Xilinx DMA IP Core driver for Linux
   *
@@ -317,7 +374,6 @@ _____________________________________________________________________________
   * The full GNU General Public License is included in this distribution in
   * the file called "COPYING".
   */
-
 
 
 

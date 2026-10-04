@@ -100,7 +100,7 @@ else
   override symverfile =
 endif
 
-DRV_OBJS := nl.o cdev.o qdma_mod.o
+DRV_OBJS := nl.o cdev.o qdma_mod.o qdma_p2pdma.o qdma_persistent.o
 ifeq ($(USER_EXTRA_SUPPORTED), 1)
 DRV_OBJS += ../user_extra/user_extra.o
 endif
